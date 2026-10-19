@@ -84,6 +84,10 @@ void sendFile(const char *filename)
 void receiveFile(const char *filename)
 {
     unsigned char packet[MAX_PAYLOAD_SIZE];
+    unsigned char startPacket[MAX_PAYLOAD_SIZE];
+    int startSize = 0;
+    long fileSize = 0;
+    long received = 0;
     FILE *file = NULL;
 
     while (TRUE)
@@ -97,8 +101,11 @@ void receiveFile(const char *filename)
 
         if (packet[0] == 1)
         {
-            long fileSize = (packet[3] << 24) | (packet[4] << 16) | (packet[5] << 8) | packet[6];
+            fileSize = (packet[3] << 24) | (packet[4] << 16) | (packet[5] << 8) | packet[6];
             printf("START received: %.*s, %ld bytes\n", packet[8], &packet[9], fileSize);
+
+            memcpy(startPacket, packet, size);
+            startSize = size;
 
             file = fopen(filename, "wb");
             if (file == NULL)
@@ -110,11 +117,28 @@ void receiveFile(const char *filename)
         else if (packet[0] == 2 && file != NULL)
         {
             int k = 256 * packet[1] + packet[2];
-            fwrite(&packet[3], 1, k, file);
+            if (k != size - 3)
+            {
+                printf("Invalid data packet size\n");
+            }
+            else
+            {
+                fwrite(&packet[3], 1, k, file);
+                received += k;
+            }
         }
         else if (packet[0] == 3)
         {
             printf("END received\n");
+
+            if (size != startSize || memcmp(&packet[1], &startPacket[1], size - 1) != 0)
+            {
+                printf("END packet does not match START packet\n");
+            }
+            if (received != fileSize)
+            {
+                printf("Received %ld bytes, expected %ld\n", received, fileSize);
+            }
             break;
         }
     }

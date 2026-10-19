@@ -13,9 +13,6 @@
 #define _POSIX_SOURCE 1 // POSIX compliant source
 #define BUF_SIZE 256
 
-#define FALSE 0
-#define TRUE 1
-
 #define FLAG 0x7E
 #define A_TX 0x03
 #define A_RX 0x01
@@ -130,8 +127,6 @@ int receiveResponse()
             continue;
         }
 
-        printf("Byte received: 0x%02X\n", byte);
-
         switch (state)
         {
         case START:
@@ -233,14 +228,14 @@ int llOpenTx(LinkLayer llParameters)
     unsigned char buf[5] = {FLAG, A_TX, C_SET, A_TX ^ C_SET, FLAG};
     State state = START;
 
-    while (state != STOP && alarmCount <= llParameters.nRetransmissions)
+    while (state != STOP && alarmCount <= nRetransmissions)
     {
         if (alarmEnabled == FALSE)
         {
             int bytes = writeBytesSerialPort(buf, 5);
             printf("SET sent (%d bytes)\n", bytes);
 
-            alarm(llParameters.timeout);
+            alarm(timeout);
             alarmEnabled = TRUE;
         }
 
