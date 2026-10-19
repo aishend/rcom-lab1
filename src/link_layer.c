@@ -22,6 +22,14 @@
 #define C_SET 0x03
 #define C_UA 0x07
 
+#define C_RR0 0xAA
+#define C_RR1 0xAB
+#define C_REJ0 0x54
+#define C_REJ1 0x55
+#define C_I0 0x00
+#define C_I1 0x80
+#define ESC 0x7D
+
 typedef enum
 {
     START,
@@ -29,11 +37,15 @@ typedef enum
     A_RCV,
     C_RCV,
     BCC_OK,
+    DATA,
     STOP
 } State;
 
 int alarmEnabled = FALSE;
 int alarmCount = 0;
+
+int Ns = 0;
+int Nr = 0;
 
 void alarmHandler(int signal)
 {
@@ -84,6 +96,96 @@ State stateMachine(State state, unsigned char byte, unsigned char a, unsigned ch
     }
 
     return state;
+}
+
+int receiveResponse()
+{
+    State state = START;
+    unsigned char c = 0;
+
+    while (state != STOP)
+    {
+        unsigned char byte;
+        int bytes = readByteSerialPort(&byte);
+
+        if (bytes < 0)
+        {
+            return -1;
+        }
+        if (bytes == 0)
+        {
+            continue;
+        }
+
+        printf("Byte received: 0x%02X\n", byte);
+
+        switch (state)
+        {
+        case START:
+            if (byte == FLAG)
+                state = FLAG_RCV;
+            break;
+        case FLAG_RCV:
+            if (byte == A_TX)
+                state = A_RCV;
+            else if (byte != FLAG)
+                state = START;
+            break;
+        case A_RCV:
+            if (byte == C_RR0 || byte == C_RR1 || byte == C_REJ0 || byte == C_REJ1)
+            {
+                c = byte;
+                state = C_RCV;
+            }
+            else if (byte == FLAG)
+                state = FLAG_RCV;
+            else
+                state = START;
+            break;
+        case C_RCV:
+            if (byte == (A_TX ^ c))
+                state = BCC_OK;
+            else if (byte == FLAG)
+                state = FLAG_RCV;
+            else
+                state = START;
+            break;
+        case BCC_OK:
+            if (byte == FLAG)
+                state = STOP;
+            else
+                state = START;
+            break;
+        default:
+            break;
+        }
+    }
+
+    return c;
+}
+
+void sendRR()
+{
+    unsigned char c = C_RR0;
+    if (Nr == 1)
+    {
+        c = C_RR1;
+    }
+
+    unsigned char buf[5] = {FLAG, A_TX, c, A_TX ^ c, FLAG};
+    writeBytesSerialPort(buf, 5);
+}
+
+void sendREJ()
+{
+    unsigned char c = C_REJ0;
+    if (Nr == 1)
+    {
+        c = C_REJ1;
+    }
+
+    unsigned char buf[5] = {FLAG, A_TX, c, A_TX ^ c, FLAG};
+    writeBytesSerialPort(buf, 5);
 }
 
 ////////////////////////////////////////////////
@@ -200,9 +302,80 @@ int llOpenRx(LinkLayer llParameters)
 ////////////////////////////////////////////////
 int llSend(const unsigned char *buf, int bufSize)
 {
-    // TODO: Implement this function
+    unsigned char frame[2 * MAX_PAYLOAD_SIZE + 7];
+    unsigned char c = C_I0;
+    if (Ns == 1)
+    {
+        c = C_I1;
+    }
 
-    return 0;
+    int size = 0;
+    frame[size++] = FLAG;
+    frame[size++] = A_TX;
+    frame[size++] = c;
+    frame[size++] = A_TX ^ c;
+
+    unsigned char bcc2 = 0;
+    for (int i = 0; i < bufSize; i++)
+    {
+        bcc2 ^= buf[i];
+
+        if (buf[i] == FLAG || buf[i] == ESC)
+        {
+            frame[size++] = ESC;
+            frame[size++] = buf[i] ^ 0x20;
+        }
+        else
+        {
+            frame[size++] = buf[i];
+        }
+    }
+
+    if (bcc2 == FLAG || bcc2 == ESC)
+    {
+        frame[size++] = ESC;
+        frame[size++] = bcc2 ^ 0x20;
+    }
+    else
+    {
+        frame[size++] = bcc2;
+    }
+
+    frame[size++] = FLAG;
+
+    unsigned char rr = C_RR1;
+    unsigned char rej = C_REJ0;
+    if (Ns == 1)
+    {
+        rr = C_RR0;
+        rej = C_REJ1;
+    }
+
+    while (TRUE)
+    {
+        int bytes = writeBytesSerialPort(frame, size);
+        printf("I frame sent (%d bytes)\n", bytes);
+
+        int response = receiveResponse();
+
+        while (response != rr && response != rej)
+        {
+            if (response < 0)
+            {
+                return -1;
+            }
+            response = receiveResponse();
+        }
+
+        if (response == rr)
+        {
+            printf("RR received\n");
+            Ns = 1 - Ns;
+            return bytes;
+        }
+
+        printf("REJ received\n");
+    }
 }
 
 ////////////////////////////////////////////////
@@ -210,9 +383,119 @@ int llSend(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 int llReceive(unsigned char *packet)
 {
-    // TODO: Implement this function
+    unsigned char frame[MAX_PAYLOAD_SIZE + 1];
 
-    return 0;
+    while (TRUE)
+    {
+        State state = START;
+        unsigned char c = 0;
+        int size = 0;
+        int escape = FALSE;
+
+        while (state != STOP)
+        {
+            unsigned char byte;
+            int bytes = readByteSerialPort(&byte);
+
+            if (bytes < 0)
+            {
+                return -1;
+            }
+            if (bytes == 0)
+            {
+                continue;
+            }
+
+            switch (state)
+            {
+            case START:
+                if (byte == FLAG)
+                    state = FLAG_RCV;
+                break;
+            case FLAG_RCV:
+                if (byte == A_TX)
+                    state = A_RCV;
+                else if (byte != FLAG)
+                    state = START;
+                break;
+            case A_RCV:
+                if (byte == C_I0 || byte == C_I1)
+                {
+                    c = byte;
+                    state = C_RCV;
+                }
+                else if (byte == FLAG)
+                    state = FLAG_RCV;
+                else
+                    state = START;
+                break;
+            case C_RCV:
+                if (byte == (A_TX ^ c))
+                {
+                    size = 0;
+                    escape = FALSE;
+                    state = DATA;
+                }
+                else if (byte == FLAG)
+                    state = FLAG_RCV;
+                else
+                    state = START;
+                break;
+            case DATA:
+                if (byte == FLAG)
+                    state = STOP;
+                else if (size > MAX_PAYLOAD_SIZE)
+                    state = START;
+                else if (byte == ESC)
+                    escape = TRUE;
+                else if (escape)
+                {
+                    frame[size++] = byte ^ 0x20;
+                    escape = FALSE;
+                }
+                else
+                    frame[size++] = byte;
+                break;
+            default:
+                break;
+            }
+        }
+
+        int n = 0;
+        if (c == C_I1)
+        {
+            n = 1;
+        }
+
+        unsigned char bcc2 = 0;
+        for (int i = 0; i < size - 1; i++)
+        {
+            bcc2 ^= frame[i];
+        }
+
+        if (size > 0 && bcc2 == frame[size - 1] && n == Nr)
+        {
+            Nr = 1 - Nr;
+            sendRR();
+            printf("I frame received, RR sent\n");
+
+            for (int i = 0; i < size - 1; i++)
+            {
+                packet[i] = frame[i];
+            }
+            return size - 1;
+        }
+        else if (n == Nr)
+        {
+            sendREJ();
+            printf("I frame with error, REJ sent\n");
+        }
+        else
+        {
+            sendRR();
+            printf("Duplicate I frame, RR sent\n");
+        }
+    }
 }
 
 ////////////////////////////////////////////////
