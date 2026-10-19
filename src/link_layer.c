@@ -84,26 +84,39 @@ int llOpenRx(LinkLayer llParameters)
     // TODO: Save the received bytes in a buffer array and print it at the end of the program.
     volatile int STOP = FALSE;
     int nBytesBuf = 0;
+    unsigned char buf[BUF_SIZE] = {0};
 
-    while (STOP == FALSE)
+    while (STOP == FALSE && nBytesBuf < BUF_SIZE)
     {
         // Read one byte from serial port.
         // NOTE: You must check how many bytes were actually read by reading the return value.
         // In this example, we assume that the byte is always read, which may not be true.
         unsigned char byte;
         int bytes = readByteSerialPort(&byte);
-        nBytesBuf += bytes;
 
-        printf("Byte received: %c\n", byte);
-
-        if (byte == 'z')
+        if (bytes == 1)
         {
-            printf("Received 'z' char. Stop reading from serial port.\n");
-            STOP = TRUE;
+            buf[nBytesBuf] = byte;
+            nBytesBuf += bytes;
+
+            printf("Byte received: %c\n", byte);
+
+            if (byte == 'z')
+            {
+                printf("Received 'z' char. Stop reading from serial port.\n");
+                STOP = TRUE;
+            }
         }
     }
 
     printf("Total bytes received: %d\n", nBytesBuf);
+
+    printf("Buffer: ");
+    for (int i = 0; i < nBytesBuf; i++)
+    {
+        printf("%c", buf[i]);
+    }
+    printf("\n");
 
     // Close serial port
     if (closeSerialPort() < 0)
