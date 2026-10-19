@@ -21,6 +21,7 @@
 #define A_RX 0x01
 #define C_SET 0x03
 #define C_UA 0x07
+#define C_DISC 0x0B
 
 #define C_RR0 0xAA
 #define C_RR1 0xAB
@@ -44,8 +45,20 @@ typedef enum
 int alarmEnabled = FALSE;
 int alarmCount = 0;
 
+int nRetransmissions = 0;
+int timeout = 0;
+
 int Ns = 0;
 int Nr = 0;
+
+int framesSent = 0;
+int retransmissions = 0;
+int timeouts = 0;
+int rejReceived = 0;
+
+int framesReceived = 0;
+int rejSent = 0;
+int duplicates = 0;
 
 void alarmHandler(int signal)
 {
@@ -206,6 +219,9 @@ int llOpenTx(LinkLayer llParameters)
 
     printf("Serial port %s opened\n", llParameters.serialPort);
 
+    nRetransmissions = llParameters.nRetransmissions;
+    timeout = llParameters.timeout;
+
     struct sigaction act = {0};
     act.sa_handler = &alarmHandler;
     if (sigaction(SIGALRM, &act, NULL) == -1)
@@ -264,6 +280,17 @@ int llOpenRx(LinkLayer llParameters)
     }
 
     printf("Serial port %s opened\n", llParameters.serialPort);
+
+    nRetransmissions = llParameters.nRetransmissions;
+    timeout = llParameters.timeout;
+
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1)
+    {
+        perror("sigaction");
+        return -1;
+    }
 
     State state = START;
 
@@ -351,31 +378,52 @@ int llSend(const unsigned char *buf, int bufSize)
         rej = C_REJ1;
     }
 
-    while (TRUE)
+    int bytes = 0;
+    alarmCount = 0;
+    alarmEnabled = FALSE;
+
+    while (alarmCount <= nRetransmissions)
     {
-        int bytes = writeBytesSerialPort(frame, size);
-        printf("I frame sent (%d bytes)\n", bytes);
+        if (alarmEnabled == FALSE)
+        {
+            bytes = writeBytesSerialPort(frame, size);
+            printf("I frame sent (%d bytes)\n", bytes);
+
+            framesSent++;
+            if (alarmCount > 0)
+            {
+                retransmissions++;
+            }
+
+            alarm(timeout);
+            alarmEnabled = TRUE;
+        }
 
         int response = receiveResponse();
 
-        while (response != rr && response != rej)
-        {
-            if (response < 0)
-            {
-                return -1;
-            }
-            response = receiveResponse();
-        }
-
         if (response == rr)
         {
+            alarm(0);
             printf("RR received\n");
             Ns = 1 - Ns;
             return bytes;
         }
 
-        printf("REJ received\n");
+        if (response == rej)
+        {
+            alarm(0);
+            printf("REJ received\n");
+            alarmEnabled = FALSE;
+            alarmCount++;
+            rejReceived++;
+        }
+        else if (alarmEnabled == FALSE)
+        {
+            timeouts++;
+        }
     }
+
+    return -1;
 }
 
 ////////////////////////////////////////////////
@@ -477,6 +525,7 @@ int llReceive(unsigned char *packet)
         {
             Nr = 1 - Nr;
             sendRR();
+            framesReceived++;
             printf("I frame received, RR sent\n");
 
             for (int i = 0; i < size - 1; i++)
@@ -489,11 +538,13 @@ int llReceive(unsigned char *packet)
         {
             sendREJ();
             printf("I frame with error, REJ sent\n");
+            rejSent++;
         }
         else
         {
             sendRR();
             printf("Duplicate I frame, RR sent\n");
+            duplicates++;
         }
     }
 }
@@ -503,14 +554,122 @@ int llReceive(unsigned char *packet)
 ////////////////////////////////////////////////
 int llCloseTx()
 {
-    // TODO: Implement this function
+    unsigned char buf[5] = {FLAG, A_TX, C_DISC, A_TX ^ C_DISC, FLAG};
+    State state = START;
+    alarmCount = 0;
+    alarmEnabled = FALSE;
+
+    while (state != STOP && alarmCount <= nRetransmissions)
+    {
+        if (alarmEnabled == FALSE)
+        {
+            int bytes = writeBytesSerialPort(buf, 5);
+            printf("DISC sent (%d bytes)\n", bytes);
+
+            alarm(timeout);
+            alarmEnabled = TRUE;
+        }
+
+        unsigned char byte;
+        int bytes = readByteSerialPort(&byte);
+
+        if (bytes > 0)
+        {
+            state = stateMachine(state, byte, A_RX, C_DISC);
+        }
+    }
+
+    alarm(0);
+
+    if (state == STOP)
+    {
+        printf("DISC received\n");
+
+        unsigned char ua[5] = {FLAG, A_RX, C_UA, A_RX ^ C_UA, FLAG};
+        int bytes = writeBytesSerialPort(ua, 5);
+        printf("UA sent (%d bytes)\n", bytes);
+    }
+
+    printf("I frames sent: %d\n", framesSent);
+    printf("Retransmissions: %d\n", retransmissions);
+    printf("Timeouts: %d\n", timeouts);
+    printf("REJ received: %d\n", rejReceived);
+
+    closeSerialPort();
+
+    if (state != STOP)
+    {
+        return -1;
+    }
 
     return 0;
 }
 
 int llCloseRx()
 {
-    // TODO: Implement this function
+    State state = START;
+
+    while (state != STOP)
+    {
+        unsigned char byte;
+        int bytes = readByteSerialPort(&byte);
+
+        if (bytes < 0)
+        {
+            return -1;
+        }
+        if (bytes == 0)
+        {
+            continue;
+        }
+
+        state = stateMachine(state, byte, A_TX, C_DISC);
+    }
+
+    printf("DISC received\n");
+
+    unsigned char buf[5] = {FLAG, A_RX, C_DISC, A_RX ^ C_DISC, FLAG};
+    state = START;
+    alarmCount = 0;
+    alarmEnabled = FALSE;
+
+    while (state != STOP && alarmCount <= nRetransmissions)
+    {
+        if (alarmEnabled == FALSE)
+        {
+            int bytes = writeBytesSerialPort(buf, 5);
+            printf("DISC sent (%d bytes)\n", bytes);
+
+            alarm(timeout);
+            alarmEnabled = TRUE;
+        }
+
+        unsigned char byte;
+        int bytes = readByteSerialPort(&byte);
+
+        if (bytes > 0)
+        {
+            state = stateMachine(state, byte, A_RX, C_UA);
+        }
+    }
+
+    alarm(0);
+
+    if (state == STOP)
+    {
+        printf("UA received\n");
+    }
+
+    printf("I frames received: %d\n", framesReceived);
+    printf("REJ sent: %d\n", rejSent);
+    printf("Duplicates: %d\n", duplicates);
+
+    closeSerialPort();
+
+    if (state != STOP)
+    {
+        return -1;
+    }
 
     return 0;
 }
